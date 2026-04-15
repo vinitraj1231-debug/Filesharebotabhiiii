@@ -24,11 +24,11 @@ from pyrogram.enums import ChatMemberStatus, ParseMode
 # 🔧 CONFIGURATION (अपनी डिटेल्स यहाँ डालें)
 # ═══════════════════════════════════════════════════════════════
 
-API_ID = 1234567  # अपना API ID यहाँ डालें
-API_HASH = "your_api_hash_here"  # अपना API HASH यहाँ डालें
-MAIN_BOT_TOKEN = "your_bot_token_here"  # अपना Main Bot Token यहाँ डालें
-MAIN_ADMIN = 0  # अपनी Telegram User ID यहाँ डालें (e.g., 12345678)
-DB_CHANNEL = -1000000000000  # अपना Database Channel ID यहाँ डालें (Must be Admin)
+API_ID = 23790796  # अपना API ID यहाँ डालें
+API_HASH = "626eb31c9057007df4c2851b3074f27f"  # अपना API HASH यहाँ डालें
+MAIN_BOT_TOKEN = "8607033631:AAEEHymSzeLeP8wpH1TR4vnZSyai3kI1DTE"  # अपना Main Bot Token यहाँ डालें
+MAIN_ADMIN = 8756786934  # अपनी Telegram User ID यहाँ डालें (e.g., 12345678)
+DB_CHANNEL = -1003982754680  # अपना Database Channel ID यहाँ डालें (Must be Admin)
 
 FILE_CACHE_DURATION = 60 * 60  # 60 minutes cache
 
