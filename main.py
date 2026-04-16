@@ -10,15 +10,17 @@
 """
 
 import os
+import sys
 import json
 import asyncio
 import hashlib
 import logging
 import random
 import shutil
+import aiohttp
 from datetime import datetime, timedelta
 from pyrogram import Client, filters, idle
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, InlineQueryResultArticle, InputTextMessageContent
 from pyrogram.errors import FloodWait, UserNotParticipant, ChatAdminRequired
 from pyrogram.enums import ChatMemberStatus, ParseMode
 
@@ -63,6 +65,13 @@ BOT_COMMANDS = [
     BotCommand("botinfo", "ℹ️ Bot information"),
     BotCommand("settimer", "⏱ Set auto-delete timer"),
     BotCommand("setwelcomeimg", "🖼 Set welcome image"),
+    BotCommand("search", "🔍 Search for files"),
+    BotCommand("points", "💰 Check your points"),
+    BotCommand("refer", "🔗 Referral link"),
+    BotCommand("premium", "🌟 Premium details"),
+    BotCommand("shortener", "🔗 Manage URL Shortener"),
+    BotCommand("buy_premium", "🎁 Buy Premium with Points"),
+    BotCommand("setlog", "📝 Set Log Channel"),
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -73,22 +82,29 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("FileStore")
 
 # ═══════════════════════════════════════════════════════════════
-# 💾 DATABASE FUNCTIONS
+# 💾 DATABASE FUNCTIONS (WITH CACHING)
 # ═══════════════════════════════════════════════════════════════
 
 os.makedirs(DB_FOLDER, exist_ok=True)
+DB_CACHE = {}
 
 def load_db(filename):
+    if filename in DB_CACHE:
+        return DB_CACHE[filename]
+
     if not os.path.exists(filename):
         with open(filename, 'w') as f:
             json.dump({}, f)
     try:
         with open(filename, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+            DB_CACHE[filename] = data
+            return data
     except:
         return {}
 
 def save_db(filename, data):
+    DB_CACHE[filename] = data
     with open(filename, 'w') as f:
         json.dump(data, f, indent=2)
 
@@ -115,16 +131,23 @@ async def backup_db_to_telegram():
     except Exception as e:
         logger.error(f"Backup failed: {e}")
 
-def add_user(user_id, bot_id, username=None, name=None):
+def add_user(user_id, bot_id, username=None, name=None, referred_by=None):
     users = load_db(USERS_DB)
     user_key = f"{bot_id}_{user_id}"
     if user_key not in users:
         users[user_key] = {
             "user_id": user_id, "bot_id": bot_id, "username": username, "name": name,
             "join_date": str(datetime.now()), "is_banned": False,
-            "files_uploaded": 0, "batches_created": 0, "bots_cloned": 0
+            "files_uploaded": 0, "batches_created": 0, "bots_cloned": 0,
+            "referred_by": referred_by, "referrals": 0, "points": 0, "is_premium": False
         }
         save_db(USERS_DB, users)
+        if referred_by:
+            ref_key = f"{bot_id}_{referred_by}"
+            if ref_key in users:
+                users[ref_key]["referrals"] = users[ref_key].get("referrals", 0) + 1
+                users[ref_key]["points"] = users[ref_key].get("points", 0) + 10 # 10 points per referral
+                save_db(USERS_DB, users)
     return users[user_key]
 
 def get_user(user_id, bot_id):
@@ -178,7 +201,12 @@ def save_bot_info(token, bot_id, bot_username, owner_id, owner_name, parent_bot_
         "custom_welcome": None,
         "welcome_image": None,
         "auto_delete_time": 600,
-        "auto_approve": False
+        "auto_approve": False,
+        "force_subs": [], # Support for multiple channels
+        "shortener_api": None,
+        "shortener_url": None,
+        "is_shortener_enabled": False,
+        "log_channel": None
     }
     save_db(BOTS_DB, bots)
     if parent_bot_id:
@@ -211,13 +239,14 @@ def get_all_descendant_bots(parent_bot_id):
     recurse(parent_bot_id)
     return all_descendants
 
-def cascade_force_sub(parent_bot_id, channel_id):
+def cascade_force_sub(parent_bot_id, force_subs):
     descendants = get_all_descendant_bots(parent_bot_id)
     bots = load_db(BOTS_DB)
     count = 0
     for bot in descendants:
-        if str(bot['bot_id']) in bots:
-            bots[str(bot['bot_id'])]['force_sub'] = channel_id
+        bot_id_str = str(bot['bot_id'])
+        if bot_id_str in bots:
+            bots[bot_id_str]['force_subs'] = force_subs
             count += 1
     save_db(BOTS_DB, bots)
     return count
@@ -260,6 +289,22 @@ def format_size(size):
             return f"{size:.2f} {unit}"
         size /= 1024.0
 
+async def get_short_link(bot_info, link):
+    if not bot_info.get("is_shortener_enabled") or not bot_info.get("shortener_api") or not bot_info.get("shortener_url"):
+        return link
+
+    api_url = f"https://{bot_info['shortener_url']}/api?api={bot_info['shortener_api']}&url={link}"
+    try:
+        session = await get_http_session()
+        async with session.get(api_url) as response:
+            data = await response.json()
+            if data.get("status") == "success":
+                return data.get("shortenedUrl")
+    except Exception as e:
+        logger.error(f"Shortener error: {e}")
+
+    return link
+
 def get_unique_id():
     return hashlib.md5(str(datetime.now().timestamp()).encode()).hexdigest()[:12]
 
@@ -271,6 +316,14 @@ START_TIME = datetime.now()
 ACTIVE_CLIENTS = {}
 TEMP_BATCH_DATA = {}
 TEMP_BROADCAST_DATA = {}
+USER_FLOOD = {}
+HTTP_SESSION = None
+
+async def get_http_session():
+    global HTTP_SESSION
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        HTTP_SESSION = aiohttp.ClientSession()
+    return HTTP_SESSION
 
 async def setup_bot_commands(app):
     try:
@@ -306,32 +359,45 @@ async def start_bot(token, parent_bot_id=None):
 
 async def check_force_sub(client, user_id):
     bot_info = get_bot_info(client.me.id)
-    if not bot_info or not bot_info.get("force_sub"):
+    if not bot_info:
         return True, None
     
-    channel_id = bot_info["force_sub"]
-    fs_link = bot_info.get("fs_link")
+    # New Multi-FS logic
+    force_subs = bot_info.get("force_subs", [])
 
-    try:
-        member = await client.get_chat_member(channel_id, user_id)
-        if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
-            return True, None
-    except UserNotParticipant:
-        pass
-    except Exception:
+    # Backward compatibility
+    if not force_subs and bot_info.get("force_sub"):
+        force_subs = [{"channel_id": bot_info["force_sub"], "invite_link": bot_info.get("fs_link")}]
+
+    if not force_subs:
         return True, None
 
-    if fs_link:
-        return False, fs_link
+    must_join = []
+    for fs in force_subs:
+        channel_id = fs["channel_id"]
+        try:
+            member = await client.get_chat_member(channel_id, user_id)
+            if member.status not in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
+                must_join.append(fs)
+        except UserNotParticipant:
+            must_join.append(fs)
+        except Exception:
+            continue
 
-    try:
-        chat = await client.get_chat(channel_id)
-        link = chat.invite_link
-        if not link:
-            link = f"https://t.me/{chat.username}" if chat.username else None
-        return False, link
-    except:
+    if not must_join:
         return True, None
+
+    # Return the first channel they need to join
+    fs = must_join[0]
+    link = fs.get("invite_link")
+    if not link:
+        try:
+            chat = await client.get_chat(fs["channel_id"])
+            link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
+        except:
+            link = None
+
+    return False, link
 
 async def broadcast_message(original_msg, bot_ids=None, status_msg=None):
     if bot_ids is None:
@@ -402,8 +468,8 @@ def get_admin_panel_keyboard():
         [InlineKeyboardButton("📢 BROADCAST", callback_data="broadcast_menu"), InlineKeyboardButton("📊 BOT STATS", callback_data="admin_stats")],
         [InlineKeyboardButton("👥 MANAGE USERS", callback_data="manage_users"), InlineKeyboardButton("🤖 CLONED BOTS", callback_data="my_bots_admin")],
         [InlineKeyboardButton("⚙️ BOT SETTINGS", callback_data="bot_settings_admin"), InlineKeyboardButton("🔒 FORCE SUB", callback_data="forcesub_admin")],
-        [InlineKeyboardButton("⏱ DELETE TIMER", callback_data="edit_timer"), InlineKeyboardButton("🖼 WELCOME IMG", callback_data="set_welcome_img")],
-        [InlineKeyboardButton("✅ AUTO APPROVE", callback_data="toggle_auto_approve")],
+        [InlineKeyboardButton("🔗 SHORTENER", callback_data="shortener_admin"), InlineKeyboardButton("⏱ DELETE TIMER", callback_data="edit_timer")],
+        [InlineKeyboardButton("🖼 WELCOME IMG", callback_data="set_welcome_img"), InlineKeyboardButton("✅ AUTO APPROVE", callback_data="toggle_auto_approve")],
         [InlineKeyboardButton("🔙 BACK TO HOME", callback_data="back_to_start")]
     ])
 
@@ -412,7 +478,8 @@ def get_supreme_panel_keyboard():
         [InlineKeyboardButton("🌍 GLOBAL BROADCAST", callback_data="global_broadcast"), InlineKeyboardButton("📊 SYSTEM STATS", callback_data="system_stats")],
         [InlineKeyboardButton("🤖 MANAGE ALL BOTS", callback_data="all_bots_list"), InlineKeyboardButton("👑 MANAGE ADMINS", callback_data="manage_admins")],
         [InlineKeyboardButton("🛠 MAINTENANCE", callback_data="toggle_maintenance"), InlineKeyboardButton("📢 GLOBAL MSG", callback_data="global_msg_set")],
-        [InlineKeyboardButton("💾 BACKUP DB", callback_data="manual_backup")],
+        [InlineKeyboardButton("💾 BACKUP DB", callback_data="manual_backup"), InlineKeyboardButton("🧹 CLEAN CACHE", callback_data="manual_clean_cache")],
+        [InlineKeyboardButton("🔄 RESTART ALL BOTS", callback_data="restart_all_bots")],
         [InlineKeyboardButton("🔙 BACK TO HOME", callback_data="back_to_start")]
     ])
 
@@ -433,6 +500,22 @@ def register_handlers(app: Client):
             except Exception as e:
                 logger.error(f"Failed to approve join request: {e}")
     
+    @app.on_message(filters.private)
+    async def flood_control_handler(client, message):
+        user_id = message.from_user.id
+        now = datetime.now()
+
+        if user_id not in USER_FLOOD:
+            USER_FLOOD[user_id] = [now]
+        else:
+            USER_FLOOD[user_id].append(now)
+            # Keep only last 5 messages within last 5 seconds
+            USER_FLOOD[user_id] = [t for t in USER_FLOOD[user_id] if (now - t).total_seconds() < 5]
+
+            if len(USER_FLOOD[user_id]) > 5:
+                await message.reply("⚠️ **Anti-Flood Triggered!** Please slow down.")
+                message.stop_propagation()
+
     @app.on_message(filters.command("start") & filters.private)
     async def start_handler(client, message):
         user_id = message.from_user.id
@@ -446,7 +529,16 @@ def register_handlers(app: Client):
         if is_user_banned(user_id, bot_id):
             return await message.reply("🚫 You are banned!")
         
-        add_user(user_id, bot_id, message.from_user.username, message.from_user.first_name)
+        # Handle referral
+        referred_by = None
+        if len(message.command) > 1 and message.command[1].startswith("ref_"):
+            try:
+                referred_by = int(message.command[1][4:])
+                if referred_by == user_id: referred_by = None # Can't refer self
+            except:
+                pass
+
+        add_user(user_id, bot_id, message.from_user.username, message.from_user.first_name, referred_by)
         
         is_subbed, channel_link = await check_force_sub(client, user_id)
         if not is_subbed and channel_link:
@@ -480,16 +572,20 @@ def register_handlers(app: Client):
                             caption=file_data.get('caption')
                         )
 
-                        # Auto-delete task
-                        async def delete_after(msg, delay):
-                            await asyncio.sleep(delay)
-                            try:
-                                await msg.delete()
-                            except:
-                                pass
+                        # Auto-delete task (Skip for premium users)
+                        user_data = get_user(user_id, bot_id)
+                        if not user_data or not user_data.get("is_premium"):
+                            async def delete_after(msg, delay):
+                                await asyncio.sleep(delay)
+                                try:
+                                    await msg.delete()
+                                except:
+                                    pass
 
-                        asyncio.create_task(delete_after(sent_msg, auto_delete_time))
-                        await message.reply(f"⏳ **Security Alert:** This file will be automatically deleted in `{auto_delete_time//60}` minutes. Please save it if needed!")
+                            asyncio.create_task(delete_after(sent_msg, auto_delete_time))
+                            await message.reply(f"⏳ **Security Alert:** This file will be automatically deleted in `{auto_delete_time//60}` minutes. Please save it if needed!")
+                        else:
+                            await message.reply("🌟 **Premium Feature:** Auto-delete is disabled for you. Enjoy your files permanently!")
                         return
                     except Exception as e:
                         logger.error(f"Copy from DB Channel failed: {e}")
@@ -747,6 +843,134 @@ def register_handlers(app: Client):
         except ValueError:
             await message.reply("❌ Invalid time format!")
 
+    @app.on_message(filters.command("shortener") & filters.private)
+    async def set_shortener_handler(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+        bot_info = get_bot_info(bot_id)
+
+        if not bot_info or (bot_info['owner_id'] != user_id and user_id != MAIN_ADMIN):
+            return await message.reply("❌ Access Denied!")
+
+        if len(message.command) < 2:
+            status = "✅ Enabled" if bot_info.get("is_shortener_enabled") else "❌ Disabled"
+            return await message.reply(
+                f"🔗 **URL Shortener Settings**\n\n"
+                f"Status: {status}\n"
+                f"URL: `{bot_info.get('shortener_url', 'Not set')}`\n"
+                f"API: `{bot_info.get('shortener_api', 'Not set')}`\n\n"
+                f"**Commands:**\n"
+                f"• `/shortener on` - Enable\n"
+                f"• `/shortener off` - Disable\n"
+                f"• `/shortener set URL API` - Set Shortener\n"
+                f"Example: `/shortener set shareus.io 1234567890abcdef`"
+            )
+
+        cmd = message.command[1].lower()
+        if cmd == "on":
+            update_bot_info(bot_id, "is_shortener_enabled", True)
+            await message.reply("✅ Shortener enabled!")
+        elif cmd == "off":
+            update_bot_info(bot_id, "is_shortener_enabled", False)
+            await message.reply("✅ Shortener disabled!")
+        elif cmd == "set":
+            if len(message.command) < 4:
+                return await message.reply("❌ Usage: `/shortener set URL API`")
+            url = message.command[2]
+            api = message.command[3]
+            update_bot_info(bot_id, "shortener_url", url)
+            update_bot_info(bot_id, "shortener_api", api)
+            await message.reply(f"✅ Shortener set to `{url}` with API key `{api}`.")
+
+    @app.on_inline_query()
+    async def inline_search_handler(client, query):
+        bot_id = client.me.id
+        q = query.query.lower()
+        if not q: return
+
+        files = load_db(FILES_DB)
+        results = []
+
+        for uid, f in files.items():
+            if f.get('bot_id') == bot_id and q in f.get('file_name', '').lower():
+                link = f"https://t.me/{client.me.username}?start=f_{uid}"
+                results.append(
+                    InlineQueryResultArticle(
+                        title=f.get('file_name'),
+                        description=f"Size: {format_size(f.get('file_size', 0))}",
+                        input_message_content=InputTextMessageContent(
+                            f"📁 **File:** `{f.get('file_name')}`\n"
+                            f"📊 **Size:** `{format_size(f.get('file_size', 0))}`\n\n"
+                            f"🔗 **Link:** {link}"
+                        ),
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Get File", url=link)]])
+                    )
+                )
+            if len(results) >= 20: break
+
+        await query.answer(results, cache_time=1)
+
+    @app.on_message(filters.command("search") & filters.private)
+    async def search_handler(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+
+        if is_user_banned(user_id, bot_id):
+            return await message.reply("🚫 Banned!")
+
+        if len(message.command) < 2:
+            return await message.reply("🔍 Usage: `/search QUERY`")
+
+        query = message.text.split(None, 1)[1].lower()
+        files = load_db(FILES_DB)
+
+        results = []
+        for uid, f in files.items():
+            if f.get('bot_id') == bot_id and query in f.get('file_name', '').lower():
+                results.append((uid, f.get('file_name')))
+
+            if len(results) >= 10: break # Limit results
+
+        if not results:
+            return await message.reply("❌ No files found!")
+
+        text = "🔍 **Search Results:**\n\n"
+        buttons = []
+        for uid, name in results:
+            link = f"https://t.me/{client.me.username}?start=f_{uid}"
+            text += f"• `{name}`\n"
+            buttons.append([InlineKeyboardButton(f"📁 {name[:25]}...", url=link)])
+
+        await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    @app.on_message(filters.command("setlog") & filters.private)
+    async def set_log_channel_handler(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+        bot_info = get_bot_info(bot_id)
+
+        if not bot_info or (bot_info['owner_id'] != user_id and user_id != MAIN_ADMIN):
+            return await message.reply("❌ Access Denied!")
+
+        if len(message.command) < 2:
+            current = bot_info.get('log_channel', 'Not Set')
+            return await message.reply(
+                f"📝 **Log Channel Settings**\n\n"
+                f"Current Channel: `{current}`\n\n"
+                f"Usage: `/setlog CHANNEL_ID` or `/setlog off`"
+            )
+
+        if message.command[1].lower() == "off":
+            update_bot_info(bot_id, 'log_channel', None)
+            return await message.reply("✅ Log channel disabled!")
+
+        try:
+            channel_id = int(message.command[1])
+            update_bot_info(bot_id, 'log_channel', channel_id)
+            await message.reply(f"✅ Log channel set to `{channel_id}`.")
+        except ValueError:
+            await message.reply("❌ Invalid Channel ID!")
+
     @app.on_message(filters.command("setwelcomeimg") & filters.private)
     async def set_welcome_img_handler(client, message):
         user_id = message.from_user.id
@@ -828,6 +1052,70 @@ def register_handlers(app: Client):
         else:
             await message.reply("❌ Not an admin!")
 
+    @app.on_message(filters.command("refer") & filters.private)
+    async def refer_cmd(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+        user_data = get_user(user_id, bot_id)
+
+        link = f"https://t.me/{client.me.username}?start=ref_{user_id}"
+        text = (
+            "🔗 **Referral Program**\n\n"
+            "Invite your friends and earn points! points can be used to get **Premium Features**.\n\n"
+            f"💰 **Your Points:** `{user_data.get('points', 0)}` pts\n"
+            f"👥 **Your Referrals:** `{user_data.get('referrals', 0)}` users\n\n"
+            f"🚀 **Your Link:** `{link}`\n\n"
+            "🎁 *Reward: 10 points per successful referral!*"
+        )
+        await message.reply(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Share Link", url=f"https://t.me/share/url?url={link}")]]))
+
+    @app.on_message(filters.command("points") & filters.private)
+    async def points_cmd(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+        user_data = get_user(user_id, bot_id)
+        await message.reply(f"💰 **You have:** `{user_data.get('points', 0)}` points.")
+
+    @app.on_message(filters.command("premium") & filters.private)
+    async def premium_cmd(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+        user_data = get_user(user_id, bot_id)
+
+        is_premium = user_data.get("is_premium", False)
+        status = "✅ Active" if is_premium else "❌ Inactive"
+
+        text = (
+            "🌟 **Premium Membership**\n\n"
+            f"Status: {status}\n\n"
+            "✨ **Benefits:**\n"
+            " ├ 🚀 No Auto-Delete for your files\n"
+            " ├ 🎯 Priority File Delivery\n"
+            " ├ 📂 Unlimited Batch Size\n"
+            " └ 🛡️ Ad-Free Experience\n\n"
+            "💰 **Cost:** 500 points or Contact Admin.\n\n"
+            "To buy with points, use `/buy_premium`"
+        )
+        await message.reply(text)
+
+    @app.on_message(filters.command("buy_premium") & filters.private)
+    async def buy_premium_handler(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+        users = load_db(USERS_DB)
+        user_key = f"{bot_id}_{user_id}"
+
+        if users[user_key].get("is_premium"):
+            return await message.reply("✅ You are already a Premium user!")
+
+        if users[user_key].get("points", 0) < 500:
+            return await message.reply("❌ You need at least 500 points to buy Premium! Refer more friends.")
+
+        users[user_key]["points"] -= 500
+        users[user_key]["is_premium"] = True
+        save_db(USERS_DB, users)
+        await message.reply("🎉 **Congratulations!** You are now a Premium user.")
+
     @app.on_message(filters.command("botinfo") & filters.private)
     async def bot_info_cmd(client, message):
         bot_id = client.me.id
@@ -898,48 +1186,73 @@ def register_handlers(app: Client):
         if not bot_info or (bot_info['owner_id'] != user_id and user_id != MAIN_ADMIN):
             return await message.reply("❌ Only owner can set force subscribe!")
         
+        force_subs = bot_info.get("force_subs", [])
+
         if len(message.command) < 2:
-            current = bot_info.get('force_sub')
-            curr_link = bot_info.get('fs_link', 'Auto-generated')
-            return await message.reply(
-                f"⚙️ **Force Subscribe Settings**\n\n"
-                f"📢 Channel: `{current if current else 'None'}`\n"
-                f"🔗 Link: `{curr_link}`\n\n"
-                f"**Commands:**\n"
-                f"• `/setfs -100xxxxxxxx` - Set channel ID\n"
-                f"• `/setfs -100xxx https://t.me/+xxxx` - Set ID & Private Invite Link\n"
-                f"• `/setfs off` - Disable Force Sub\n\n"
-                f"⚠️ *Ensure the bot is Admin in the channel!*"
+            text = "⚙️ **Force Subscribe Settings (Up to 3 Channels)**\n\n"
+            if not force_subs:
+                text += "No channels configured.\n"
+            else:
+                for i, fs in enumerate(force_subs, 1):
+                    text += f"{i}. 🆔 `{fs['channel_id']}`\n   🔗 Link: {fs.get('invite_link') or 'Auto'}\n"
+
+            text += (
+                "\n**Commands:**\n"
+                "• `/setfs add -100xxx link` - Add channel\n"
+                "• `/setfs del -100xxx` - Remove channel\n"
+                "• `/setfs clear` - Clear all\n"
+                "• `/setfs off` - Disable FS\n\n"
+                "⚠️ *Bot must be Admin in channels!*"
             )
+            return await message.reply(text)
         
-        if message.command[1].lower() == "off":
+        cmd = message.command[1].lower()
+        
+        if cmd == "clear" or cmd == "off":
+            update_bot_info(bot_id, 'force_subs', [])
             update_bot_info(bot_id, 'force_sub', None)
-            update_bot_info(bot_id, 'fs_link', None)
-            count = cascade_force_sub(bot_id, None) if bot_info['owner_id'] == user_id else 0
-            return await message.reply(f"✅ Force Sub removed! (Also removed from {count} child bots)")
-        
-        try:
-            channel_id = int(message.command[1])
-            custom_link = message.command[2] if len(message.command) > 2 else None
+            count = cascade_force_sub(bot_id, []) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
+            return await message.reply(f"✅ All Force Sub channels cleared! (Applied to {count} child bots)")
 
-            # Check admin rights
+        if cmd == "add":
+            if len(force_subs) >= 3:
+                return await message.reply("❌ Maximum 3 channels allowed!")
+
+            if len(message.command) < 3:
+                return await message.reply("Usage: `/setfs add -100xxxxxxxx [invite_link]`")
+
             try:
-                chat_member = await client.get_chat_member(channel_id, client.me.id)
-                if chat_member.status != ChatMemberStatus.ADMINISTRATOR:
-                    return await message.reply("❌ I am not Admin in that channel!")
-            except Exception:
-                 return await message.reply("❌ Cannot access channel! Make sure I am Admin and ID is correct.")
+                channel_id = int(message.command[2])
+                invite_link = message.command[3] if len(message.command) > 3 else None
 
-            chat = await client.get_chat(channel_id)
-            update_bot_info(bot_id, 'force_sub', channel_id)
-            update_bot_info(bot_id, 'fs_link', custom_link)
+                # Check admin
+                try:
+                    await client.get_chat_member(channel_id, client.me.id)
+                except Exception:
+                    return await message.reply("❌ I am not Admin or cannot access channel!")
+
+                force_subs.append({"channel_id": channel_id, "invite_link": invite_link})
+                update_bot_info(bot_id, 'force_subs', force_subs)
+                count = cascade_force_sub(bot_id, force_subs) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
+                return await message.reply(f"✅ Channel added to Force Subscribe! (Applied to {count} child bots)")
+            except ValueError:
+                return await message.reply("❌ Invalid Channel ID!")
+
+        if cmd == "del":
+            if len(message.command) < 3:
+                return await message.reply("Usage: `/setfs del -100xxxxxxxx`")
             
-            count = cascade_force_sub(bot_id, channel_id) if bot_info['owner_id'] == user_id else 0
-            await message.reply(f"✅ **Force Sub Set!**\n\n📢 {chat.title}\n🆔 `{channel_id}`\n🔗 Link: {custom_link or 'Default'}\n\nApplied to {count} child bots.")
-        except ValueError:
-            await message.reply("❌ Invalid Channel ID!")
-        except Exception as e:
-            await message.reply(f"❌ Error: {e}")
+            try:
+                channel_id = int(message.command[2])
+                new_fs = [fs for fs in force_subs if fs['channel_id'] != channel_id]
+                if len(new_fs) == len(force_subs):
+                    return await message.reply("❌ Channel not found in list!")
+
+                update_bot_info(bot_id, 'force_subs', new_fs)
+                count = cascade_force_sub(bot_id, new_fs) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
+                return await message.reply(f"✅ Channel removed from Force Subscribe! (Applied to {count} child bots)")
+            except ValueError:
+                return await message.reply("❌ Invalid Channel ID!")
 
     @app.on_message(filters.command("broadcast") & filters.private)
     async def broadcast_cmd(client, message):
@@ -997,6 +1310,9 @@ def register_handlers(app: Client):
     @app.on_message(filters.command("done") & filters.private)
     async def batch_done(client, message):
         user_id = message.from_user.id
+        bot_id = client.me.id
+        bot_info = get_bot_info(bot_id)
+
         if user_id not in TEMP_BATCH_DATA or not TEMP_BATCH_DATA[user_id]:
             return await message.reply("❌ No files in batch! Start with `/batch`.")
         
@@ -1005,16 +1321,18 @@ def register_handlers(app: Client):
         
         batches = load_db(BATCH_DB)
         batches[batch_id] = {
-            "files": file_ids, "created_by": user_id, "bot_id": client.me.id, "date": str(datetime.now())
+            "files": file_ids, "created_by": user_id, "bot_id": bot_id, "date": str(datetime.now())
         }
         save_db(BATCH_DB, batches)
         del TEMP_BATCH_DATA[user_id]
-        update_user_stats(user_id, client.me.id, "batches_created")
+        update_user_stats(user_id, bot_id, "batches_created")
         
         link = f"https://t.me/{client.me.username}?start=b_{batch_id}"
+        short_link = await get_short_link(bot_info, link)
+
         await message.reply(
-            f"✅ **Batch Created!**\n\n📦 Files: {len(file_ids)}\n🔗 `{link}`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Share Batch", url=f"https://t.me/share/url?url={link}")]])
+            f"✅ **Batch Created!**\n\n📦 Files: {len(file_ids)}\n🔗 `{short_link}`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Share Batch", url=f"https://t.me/share/url?url={short_link}")]])
         )
 
     @app.on_message(filters.command("cancel") & filters.private)
@@ -1315,14 +1633,41 @@ def register_handlers(app: Client):
             await backup_db_to_telegram()
             await callback.answer("✅ Backup sent to DB Channel!", show_alert=True)
 
+        elif data == "manual_clean_cache":
+            if user_id != MAIN_ADMIN: return
+            count = clean_expired_cache()
+            await callback.answer(f"🧹 Cleaned {count} expired cache entries!", show_alert=True)
+
+        elif data == "restart_all_bots":
+            if user_id != MAIN_ADMIN: return
+            await callback.answer("🔄 Restarting System... Please wait.", show_alert=True)
+            logger.info("Restarting process...")
+            os.execl(sys.executable, sys.executable, *sys.argv)
+
         elif data == "forcesub_admin":
             bot_info = get_bot_info(bot_id)
             if not bot_info: return
-            curr_fs = bot_info.get('force_sub', 'Not Set')
+            force_subs = bot_info.get("force_subs", [])
+            text = "🔒 **Force Subscribe Settings (Up to 3 Channels)**\n\n"
+            if not force_subs:
+                text += "No channels configured.\n"
+            else:
+                for i, fs in enumerate(force_subs, 1):
+                    text += f"{i}. 🆔 `{fs['channel_id']}`\n"
+
+            text += "\nTo manage, use command:\n`/setfs`"
+            await callback.message.edit(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
+            await callback.answer()
+
+        elif data == "shortener_admin":
+            bot_info = get_bot_info(bot_id)
+            if not bot_info: return
+            status = "✅ Enabled" if bot_info.get("is_shortener_enabled") else "❌ Disabled"
             text = (
-                f"🔒 **Force Subscribe Settings**\n\n"
-                f"Current Channel: `{curr_fs}`\n\n"
-                f"To change, use command:\n`/setfs CHANNEL_ID` or `/setfs off`"
+                f"🔗 **URL Shortener Settings**\n\n"
+                f"Status: {status}\n"
+                f"URL: `{bot_info.get('shortener_url', 'Not set')}`\n\n"
+                f"To change, use command:\n`/shortener`"
             )
             await callback.message.edit(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
             await callback.answer()
@@ -1422,6 +1767,14 @@ def register_handlers(app: Client):
         add_to_cache(file_id, db_msg.id, DB_CHANNEL, bot_id, original_caption)
         update_user_stats(user_id, bot_id, "files_uploaded")
         
+        # Log to Log Channel
+        bot_info = get_bot_info(bot_id)
+        if bot_info and bot_info.get("log_channel"):
+            try:
+                await client.copy_message(bot_info["log_channel"], message.chat.id, message.id, caption=f"📤 **File Uploaded**\n👤 User: `{user_id}`\n🏷 Name: `{file_name}`")
+            except:
+                pass
+
         # Check Batch Mode
         if user_id in TEMP_BATCH_DATA:
             TEMP_BATCH_DATA[user_id].append(unique_id)
@@ -1431,17 +1784,23 @@ def register_handlers(app: Client):
             )
         else:
             # Single File Link
+            bot_info = get_bot_info(bot_id)
             link = f"https://t.me/{client.me.username}?start=f_{unique_id}"
+            short_link = await get_short_link(bot_info, link)
+
             await message.reply(
-                f"✅ **File Saved!**\n\n📁 `{file_name}`\n📊 {format_size(file_size)}\n\n🔗 **Link:**\n`{link}`",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Share Link", url=f"https://t.me/share/url?url={link}")]])
+                f"✅ **File Saved!**\n\n📁 `{file_name}`\n📊 {format_size(file_size)}\n\n🔗 **Link:**\n`{short_link}`",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Share Link", url=f"https://t.me/share/url?url={short_link}")]])
             )
 
 async def background_tasks():
     while True:
         await asyncio.sleep(600) # Every 10 mins
         try:
-            # 1. Clean Cache
+            # 1. Clean Flood data to prevent memory leak
+            USER_FLOOD.clear()
+
+            # 2. Clean Cache
             count = clean_expired_cache()
             if count > 0:
                 logger.info(f"🗑 Cleaned {count} expired cache entries")
@@ -1502,6 +1861,8 @@ async def main():
     
     # Shutdown sequence
     logger.info("🛑 Shutting down all bots...")
+    if HTTP_SESSION:
+        await HTTP_SESSION.close()
     for client_data in ACTIVE_CLIENTS.values():
         try:
             await client_data["app"].stop()
