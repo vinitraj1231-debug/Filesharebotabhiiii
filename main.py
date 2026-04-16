@@ -153,6 +153,12 @@ def update_user_stats(user_id, bot_id, field):
         save_db(USERS_DB, users)
 
 def is_user_banned(user_id, bot_id):
+    # Global Ban Check
+    config = get_global_config()
+    global_bans = config.get("global_bans", [])
+    if user_id in global_bans:
+        return True
+
     user = get_user(user_id, bot_id)
     return user.get("is_banned", False) if user else False
 
@@ -668,7 +674,7 @@ def register_handlers(app: Client):
         
         await message.reply(text)
 
-    @app.on_message(filters.command(["ban", "unban", "info", "setpremium"]) & filters.private)
+    @app.on_message(filters.command(["ban", "unban", "info", "setpremium", "gban", "ungban"]) & filters.private)
     async def admin_utils_handler(client, message):
         user_id = message.from_user.id
         bot_id = client.me.id
@@ -704,6 +710,26 @@ def register_handlers(app: Client):
                     await message.reply(f"💎 User `{target}` is now a **Premium** user!")
                 else:
                     await message.reply("❌ User not found.")
+            elif cmd == "gban":
+                if user_id != MAIN_ADMIN: return
+                config = get_global_config()
+                gbans = config.get("global_bans", [])
+                if target not in gbans:
+                    gbans.append(target)
+                    update_global_config("global_bans", gbans)
+                    await message.reply(f"🌍 **Globally Banned** `{target}`!")
+                else:
+                    await message.reply("❌ User already globally banned.")
+            elif cmd == "ungban":
+                if user_id != MAIN_ADMIN: return
+                config = get_global_config()
+                gbans = config.get("global_bans", [])
+                if target in gbans:
+                    gbans.remove(target)
+                    update_global_config("global_bans", gbans)
+                    await message.reply(f"✅ **Globally Unbanned** `{target}`!")
+                else:
+                    await message.reply("❌ User not in global ban list.")
             elif cmd == "info":
                 user = get_user(target, bot_id)
                 if not user:
@@ -870,7 +896,7 @@ def register_handlers(app: Client):
                 f"⚠️ Note: Bot must be Admin in the channel!"
             )
             return await message.reply(text)
-        
+
         cmd = message.command[1].lower()
         
         if cmd == "clear":
