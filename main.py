@@ -87,6 +87,7 @@ BOT_COMMANDS = [
     BotCommand("shortener", "🔗 Manage URL Shortener"),
     BotCommand("buy_premium", "🎁 Buy Premium with Points"),
     BotCommand("setlog", "📝 Set Log Channel"),
+    BotCommand("restart", "🔄 Restart all bots (Supreme Only)"),
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -154,13 +155,6 @@ def add_user(user_id, bot_id, username=None, name=None, referred_by=None):
             "user_id": user_id, "bot_id": bot_id, "username": username, "name": name,
             "join_date": str(datetime.now()), "is_banned": False,
             "files_uploaded": 0, "batches_created": 0, "bots_cloned": 0,
- advanced-filestore-bot-upgrade-16475289135707005334
-            "referred_by": referred_by, "referrals": 0, "is_premium": False
-        }
-        save_db(USERS_DB, users)
-        if referred_by:
-            update_user_stats(referred_by, bot_id, "referrals")
-
             "referred_by": referred_by, "referrals": 0, "points": 0, "is_premium": False
         }
         save_db(USERS_DB, users)
@@ -170,7 +164,6 @@ def add_user(user_id, bot_id, username=None, name=None, referred_by=None):
                 users[ref_key]["referrals"] = users[ref_key].get("referrals", 0) + 1
                 users[ref_key]["points"] = users[ref_key].get("points", 0) + 10 # 10 points per referral
                 save_db(USERS_DB, users)
- main
     return users[user_key]
 
 def get_user(user_id, bot_id):
@@ -226,11 +219,8 @@ def save_bot_info(token, bot_id, bot_username, owner_id, owner_name, parent_bot_
     bots[str(bot_id)] = {
         "token": token, "bot_id": bot_id, "bot_username": bot_username,
         "owner_id": owner_id, "owner_name": owner_name, "parent_bot_id": parent_bot_id,
- advanced-filestore-bot-upgrade-16475289135707005334
-        "created_on": str(datetime.now()), "force_subs": [], "is_active": True,
-        "custom_welcome": None, "auto_delete_timer": 600
-
-        "created_on": str(datetime.now()), "force_sub": None, "fs_link": None, "is_active": True,
+        "created_on": str(datetime.now()),
+        "is_active": True,
         "custom_welcome": None,
         "welcome_image": None,
         "auto_delete_time": 600,
@@ -240,7 +230,6 @@ def save_bot_info(token, bot_id, bot_username, owner_id, owner_name, parent_bot_
         "shortener_url": None,
         "is_shortener_enabled": False,
         "log_channel": None
- main
     }
     save_db(BOTS_DB, bots)
     if parent_bot_id:
@@ -273,23 +262,14 @@ def get_all_descendant_bots(parent_bot_id):
     recurse(parent_bot_id)
     return all_descendants
 
- advanced-filestore-bot-upgrade-16475289135707005334
 def cascade_force_subs(parent_bot_id, force_subs):
-
-def cascade_force_sub(parent_bot_id, force_subs):
- main
     descendants = get_all_descendant_bots(parent_bot_id)
     bots = load_db(BOTS_DB)
     count = 0
     for bot in descendants:
- advanced-filestore-bot-upgrade-16475289135707005334
-        if str(bot['bot_id']) in bots:
-            bots[str(bot['bot_id'])]['force_subs'] = force_subs
-
         bot_id_str = str(bot['bot_id'])
         if bot_id_str in bots:
             bots[bot_id_str]['force_subs'] = force_subs
- main
             count += 1
     save_db(BOTS_DB, bots)
     return count
@@ -402,53 +382,19 @@ async def start_bot(token, parent_bot_id=None):
 
 async def check_force_sub(client, user_id):
     bot_info = get_bot_info(client.me.id)
- advanced-filestore-bot-upgrade-16475289135707005334
-    if not bot_info or not bot_info.get("force_subs"):
-        return True, []
-    
-    must_join = []
-    for channel_id in bot_info["force_subs"]:
-        try:
-            member = await client.get_chat_member(channel_id, user_id)
-            if member.status not in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
-                must_join.append(channel_id)
-        except UserNotParticipant:
-            must_join.append(channel_id)
-        except Exception:
-            # Skip if bot is not admin in that channel
-            continue
-
-    if not must_join:
-        return True, []
-
-    links = []
-    for c_id in must_join:
-        try:
-            chat = await client.get_chat(c_id)
-            link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
-            if link:
-                links.append({"title": chat.title, "link": link})
-        except:
-            continue
-
-    return (False, links) if links else (True, [])
-
     if not bot_info:
-        return True, None
+        return True, []
     
-    # New Multi-FS logic
     force_subs = bot_info.get("force_subs", [])
-
-    # Backward compatibility
-    if not force_subs and bot_info.get("force_sub"):
-        force_subs = [{"channel_id": bot_info["force_sub"], "invite_link": bot_info.get("fs_link")}]
-
     if not force_subs:
-        return True, None
+        return True, []
 
     must_join = []
     for fs in force_subs:
-        channel_id = fs["channel_id"]
+        if isinstance(fs, dict):
+            channel_id = fs["channel_id"]
+        else:
+            channel_id = fs
         try:
             member = await client.get_chat_member(channel_id, user_id)
             if member.status not in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
@@ -459,20 +405,26 @@ async def check_force_sub(client, user_id):
             continue
 
     if not must_join:
-        return True, None
+        return True, []
 
-    # Return the first channel they need to join
-    fs = must_join[0]
-    link = fs.get("invite_link")
-    if not link:
-        try:
-            chat = await client.get_chat(fs["channel_id"])
-            link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
-        except:
+    links = []
+    for fs in must_join:
+        if isinstance(fs, dict):
+            channel_id = fs["channel_id"]
+            link = fs.get("invite_link")
+        else:
+            channel_id = fs
             link = None
+        try:
+            chat = await client.get_chat(channel_id)
+            if not link:
+                link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
+            if link:
+                links.append({"title": chat.title, "link": link})
+        except:
+            continue
 
-    return False, link
- main
+    return (False, links) if links else (True, [])
 
 async def broadcast_message(original_msg, bot_ids=None, status_msg=None):
     if bot_ids is None:
@@ -480,8 +432,7 @@ async def broadcast_message(original_msg, bot_ids=None, status_msg=None):
     
     total_bots = len(bot_ids)
     success, failed = 0, 0
- advanced-filestore-bot-upgrade-16475289135707005334
-    total_bots = len(bot_ids)
+    start_time = datetime.now()
 
     for b_idx, bot_id in enumerate(bot_ids, 1):
         if bot_id not in ACTIVE_CLIENTS:
@@ -494,63 +445,30 @@ async def broadcast_message(original_msg, bot_ids=None, status_msg=None):
 
         for u_idx, user in enumerate(users, 1):
             try:
-                # Advanced Copy logic (handles all media types + buttons)
-
-    start_time = datetime.now()
-
-    for i, bot_id in enumerate(bot_ids, 1):
-        if bot_id not in ACTIVE_CLIENTS:
-            continue
-        app = ACTIVE_CLIENTS[bot_id]["app"]
-        users = get_all_users(bot_id)
-
-        for j, user in enumerate(users, 1):
-            try:
- main
                 await original_msg.copy(user['user_id'])
                 success += 1
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 await original_msg.copy(user['user_id'])
                 success += 1
- advanced-filestore-bot-upgrade-16475289135707005334
-            except:
+            except Exception:
                 failed += 1
 
             # Real-time progress tracking
-            if status_msg and (success + failed) % 10 == 0:
+            if status_msg and (success + failed) % 20 == 0:
                 try:
+                    elapsed = (datetime.now() - start_time).seconds
                     progress = f"📢 **Broadcast Progress**\n\n" \
                                f"🤖 Bot: {b_idx}/{total_bots} (@{client_data['username']})\n" \
                                f"👥 Users: {u_idx}/{total_users}\n" \
                                f"━━━━━━━━━━━━━━━━━━━━\n" \
                                f"✅ Success: `{success}`\n" \
                                f"❌ Failed: `{failed}`\n" \
-                               f"📊 Total: `{success + failed}`"
+                               f"⏳ Time: `{elapsed}s`"
                     await status_msg.edit(progress)
                 except:
                     pass
             await asyncio.sleep(0.05) # Flood prevention
-
-            except Exception:
-                failed += 1
-
-            # Update status occasionally
-            if (success + failed) % 20 == 0 and status_msg:
-                try:
-                    elapsed = (datetime.now() - start_time).seconds
-                    await status_msg.edit(
-                        f"📢 **Broadcast Progress**\n\n"
-                        f"🤖 Bot: {i}/{total_bots} (@{ACTIVE_CLIENTS[bot_id]['username']})\n"
-                        f"👥 Users: {j}/{len(users)}\n\n"
-                        f"✅ Success: `{success}`\n"
-                        f"❌ Failed: `{failed}`\n"
-                        f"⏳ Time: `{elapsed}s`"
-                    )
-                except:
-                    pass
-            await asyncio.sleep(0.05)
- main
 
     return success, failed
 
@@ -569,16 +487,10 @@ def get_start_keyboard(bot_id, user_id):
         buttons.append([InlineKeyboardButton("⚡ ADMIN PANEL ⚡", callback_data="admin_panel")])
     
     buttons.extend([
- advanced-filestore-bot-upgrade-16475289135707005334
-        [InlineKeyboardButton("📦 Batch", callback_data="start_batch"), InlineKeyboardButton("🤖 Clone", callback_data="clone_menu")],
-        [InlineKeyboardButton("📊 Dashboard", callback_data="user_dashboard"), InlineKeyboardButton("🎁 Referral", callback_data="referral_menu")],
-        [InlineKeyboardButton("🎯 My Bots", callback_data="my_bots_menu"), InlineKeyboardButton("⚙️ Settings", callback_data="bot_settings")],
-        [InlineKeyboardButton("💎 Premium", callback_data="premium_menu"), InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")]
-
-        [InlineKeyboardButton("📦 CREATE BATCH", callback_data="start_batch"), InlineKeyboardButton("🤖 CLONE BOT", callback_data="clone_menu")],
-        [InlineKeyboardButton("📊 DASHBOARD", callback_data="user_dashboard"), InlineKeyboardButton("🎯 MY BOTS", callback_data="my_bots_menu")],
-        [InlineKeyboardButton("⚙️ SETTINGS", callback_data="bot_settings"), InlineKeyboardButton("ℹ️ HELP & INFO", callback_data="help_menu")]
- main
+        [InlineKeyboardButton("📦 BATCH", callback_data="start_batch"), InlineKeyboardButton("🤖 CLONE", callback_data="clone_menu")],
+        [InlineKeyboardButton("📊 DASHBOARD", callback_data="user_dashboard"), InlineKeyboardButton("🎁 REFERRAL", callback_data="referral_menu")],
+        [InlineKeyboardButton("🎯 MY BOTS", callback_data="my_bots_menu"), InlineKeyboardButton("⚙️ SETTINGS", callback_data="bot_settings")],
+        [InlineKeyboardButton("💎 PREMIUM", callback_data="premium_menu"), InlineKeyboardButton("ℹ️ HELP", callback_data="help_menu")]
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -619,6 +531,14 @@ def register_handlers(app: Client):
             except Exception as e:
                 logger.error(f"Failed to approve join request: {e}")
     
+    @app.on_message(filters.command("restart") & filters.private)
+    async def restart_cmd(client, message):
+        if message.from_user.id != MAIN_ADMIN:
+            return
+        await message.reply("🔄 Restarting System... Please wait.")
+        logger.info(f"Restarting system by {message.from_user.id}")
+        os.execl(sys.executable, sys.executable, *sys.argv)
+
     @app.on_message(filters.private)
     async def flood_control_handler(client, message):
         user_id = message.from_user.id
@@ -648,19 +568,12 @@ def register_handlers(app: Client):
         if is_user_banned(user_id, bot_id):
             return await message.reply("🚫 You are banned!")
         
- advanced-filestore-bot-upgrade-16475289135707005334
-
         # Handle referral
- main
         referred_by = None
         if len(message.command) > 1 and message.command[1].startswith("ref_"):
             try:
                 referred_by = int(message.command[1][4:])
- advanced-filestore-bot-upgrade-16475289135707005334
-                if referred_by == user_id: referred_by = None
-
                 if referred_by == user_id: referred_by = None # Can't refer self
- main
             except:
                 pass
 
@@ -692,13 +605,10 @@ def register_handlers(app: Client):
                 file_data = files.get(unique_id)
                 
                 if file_data:
- advanced-filestore-bot-upgrade-16475289135707005334
                     # Auto-delete Timer logic (High Advance Feature)
                     bot_info = get_bot_info(bot_id)
-                    auto_delete_time = bot_info.get("auto_delete_timer", 600)
+                    auto_delete_time = bot_info.get("auto_delete_time", 600)
 
-
- main
                     # 1. Try copying from DB Channel (Most Reliable)
                     try:
                         sent_msg = await client.copy_message(
@@ -708,17 +618,9 @@ def register_handlers(app: Client):
                             caption=file_data.get('caption')
                         )
 
- advanced-filestore-bot-upgrade-16475289135707005334
-                        # Auto-delete task (Premium bypass)
-                        user_data = get_user(user_id, bot_id)
-                        if user_data and user_data.get("is_premium"):
-                            await message.reply("💎 **Premium User Detected!** Auto-delete disabled for you.")
-                        else:
-
                         # Auto-delete task (Skip for premium users)
                         user_data = get_user(user_id, bot_id)
                         if not user_data or not user_data.get("is_premium"):
- main
                             async def delete_after(msg, delay):
                                 await asyncio.sleep(delay)
                                 try:
@@ -727,13 +629,9 @@ def register_handlers(app: Client):
                                     pass
 
                             asyncio.create_task(delete_after(sent_msg, auto_delete_time))
- advanced-filestore-bot-upgrade-16475289135707005334
-                            await message.reply(f"⏳ This file will be deleted automatically in {auto_delete_time//60} minutes for security reasons.")
-
                             await message.reply(f"⏳ **Security Alert:** This file will be automatically deleted in `{auto_delete_time//60}` minutes. Please save it if needed!")
                         else:
                             await message.reply("🌟 **Premium Feature:** Auto-delete is disabled for you. Enjoy your files permanently!")
- main
                         return
                     except Exception as e:
                         logger.error(f"Copy from DB Channel failed: {e}")
@@ -802,13 +700,8 @@ def register_handlers(app: Client):
                 return
         
         # Standard Welcome
- advanced-filestore-bot-upgrade-16475289135707005334
         bot_info = get_bot_info(bot_id)
         config = get_global_config()
-
-      
-  config = load_db(CONFIG_DB)
- main
         global_msg = config.get("global_msg", "")
         welcome = bot_info.get('custom_welcome') if bot_info else None
         welcome_image = bot_info.get('welcome_image') if bot_info else None
@@ -994,25 +887,6 @@ def register_handlers(app: Client):
         except ValueError:
             await message.reply("❌ Invalid User ID!")
 
-    @app.on_message(filters.command("settimer") & filters.private)
-    async def set_timer_handler(client, message):
-        user_id = message.from_user.id
-        bot_id = client.me.id
-        bot_info = get_bot_info(bot_id)
-
-        if not bot_info or (bot_info['owner_id'] != user_id and user_id != MAIN_ADMIN):
-            return await message.reply("❌ No permission!")
-
-        if len(message.command) < 2:
-            return await message.reply("Usage: `/settimer SECONDS`")
-
-        try:
-            seconds = int(message.command[1])
-            if seconds < 0: raise ValueError
-            update_bot_info(bot_id, 'auto_delete_timer', seconds)
-            await message.reply(f"✅ Auto-delete timer set to `{seconds}` seconds.")
-        except:
-            await message.reply("❌ Invalid seconds!")
 
     @app.on_message(filters.command("setmsg") & filters.private)
     async def set_msg_handler(client, message):
@@ -1389,74 +1263,6 @@ def register_handlers(app: Client):
         if not bot_info or (bot_info['owner_id'] != user_id and user_id != MAIN_ADMIN):
             return await message.reply("❌ Only owner can set force subscribe!")
         
- advanced-filestore-bot-upgrade-16475289135707005334
-        force_subs = bot_info.get('force_subs', [])
-
-        if len(message.command) < 2:
-            text = "⚙️ **Force Subscribe Settings (Up to 6)**\n\n"
-            if force_subs:
-                for i, c_id in enumerate(force_subs, 1):
-                    text += f"{i}. `{c_id}`\n"
-            else:
-                text += "❌ No channels set."
-
-            text += (
-                f"\n**Add:** `/setfs -100xxxxxxxx`\n"
-                f"**Remove:** `/setfs off -100xxxx`\n"
-                f"**Clear All:** `/setfs clear`\n\n"
-                f"⚠️ Note: Bot must be Admin in the channel!"
-            )
-            return await message.reply(text)
-
-        cmd = message.command[1].lower()
-        
-        if cmd == "clear":
-            update_bot_info(bot_id, 'force_subs', [])
-            cascade_force_subs(bot_id, [])
-            return await message.reply("✅ All Force Sub channels cleared!")
-
-        if cmd == "off":
-            if len(message.command) < 3:
-                return await message.reply("Usage: `/setfs off -100xxxxxx` to remove specific channel.")
-            try:
-                target_id = int(message.command[2])
-                if target_id in force_subs:
-                    force_subs.remove(target_id)
-                    update_bot_info(bot_id, 'force_subs', force_subs)
-                    cascade_force_subs(bot_id, force_subs)
-                    return await message.reply(f"✅ Removed `{target_id}` from Force Sub.")
-                else:
-                    return await message.reply("❌ Channel not found in list.")
-            except:
-                return await message.reply("❌ Invalid Channel ID.")
-
-        try:
-            channel_id = int(message.command[1])
-            if channel_id in force_subs:
-                return await message.reply("❌ Channel already added.")
-
-            if len(force_subs) >= 6:
-                return await message.reply("❌ Maximum 6 channels allowed!")
-
-            # Check admin rights
-            try:
-                chat_member = await client.get_chat_member(channel_id, client.me.id)
-                if chat_member.status != ChatMemberStatus.ADMINISTRATOR:
-                    return await message.reply("❌ I am not Admin in that channel!")
-            except Exception:
-                 return await message.reply("❌ Cannot access channel! Make sure I am Admin and ID is correct.")
-
-            chat = await client.get_chat(channel_id)
-            force_subs.append(channel_id)
-            update_bot_info(bot_id, 'force_subs', force_subs)
-            
-            count = cascade_force_subs(bot_id, force_subs) if bot_info['owner_id'] == user_id else 0
-            await message.reply(f"✅ **Channel Added!**\n\n📢 {chat.title}\n🆔 `{channel_id}`\n\nApplied to {count} child bots automatically.")
-        except ValueError:
-            await message.reply("❌ Invalid Channel ID!")
-        except Exception as e:
-            await message.reply(f"❌ Error: {e}")
-
         force_subs = bot_info.get("force_subs", [])
 
         if len(message.command) < 2:
@@ -1481,8 +1287,7 @@ def register_handlers(app: Client):
         
         if cmd == "clear" or cmd == "off":
             update_bot_info(bot_id, 'force_subs', [])
-            update_bot_info(bot_id, 'force_sub', None)
-            count = cascade_force_sub(bot_id, []) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
+            count = cascade_force_subs(bot_id, []) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
             return await message.reply(f"✅ All Force Sub channels cleared! (Applied to {count} child bots)")
 
         if cmd == "add":
@@ -1504,7 +1309,7 @@ def register_handlers(app: Client):
 
                 force_subs.append({"channel_id": channel_id, "invite_link": invite_link})
                 update_bot_info(bot_id, 'force_subs', force_subs)
-                count = cascade_force_sub(bot_id, force_subs) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
+                count = cascade_force_subs(bot_id, force_subs) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
                 return await message.reply(f"✅ Channel added to Force Subscribe! (Applied to {count} child bots)")
             except ValueError:
                 return await message.reply("❌ Invalid Channel ID!")
@@ -1520,11 +1325,10 @@ def register_handlers(app: Client):
                     return await message.reply("❌ Channel not found in list!")
 
                 update_bot_info(bot_id, 'force_subs', new_fs)
-                count = cascade_force_sub(bot_id, new_fs) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
+                count = cascade_force_subs(bot_id, new_fs) if bot_info['owner_id'] == user_id or user_id == MAIN_ADMIN else 0
                 return await message.reply(f"✅ Channel removed from Force Subscribe! (Applied to {count} child bots)")
             except ValueError:
                 return await message.reply("❌ Invalid Channel ID!")
- main
 
     @app.on_message(filters.command("broadcast") & filters.private)
     async def broadcast_cmd(client, message):
@@ -1899,26 +1703,17 @@ def register_handlers(app: Client):
                 f"⚙️ **Bot Settings**\n\n"
                 f"🤖 Bot: @{bot_info['bot_username']}\n"
                 f"👋 Custom Welcome: {'Enabled' if bot_info.get('custom_welcome') else 'Disabled'}\n"
- advanced-filestore-bot-upgrade-16475289135707005334
-                f"⏱ Auto Delete: {bot_info.get('auto_delete_timer', 600)//60} Mins"
-            )
-            buttons = [
-                [InlineKeyboardButton("💬 Set Welcome", callback_data="set_welcome_msg")],
-                [InlineKeyboardButton("⏱ Set Timer", callback_data="set_delete_timer")],
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-
                 f"⏱ Auto Delete: `{bot_info.get('auto_delete_time', 600)}` seconds\n"
                 f"✅ Auto Approve: {'ON' if bot_info.get('auto_approve') else 'OFF'}"
             )
             buttons = [
                 [InlineKeyboardButton("💬 SET WELCOME MSG", callback_data="set_welcome_msg")],
+                [InlineKeyboardButton("⏱ SET TIMER", callback_data="set_delete_timer")],
                 [InlineKeyboardButton("🔙 BACK", callback_data="admin_panel")]
- main
             ]
             await callback.message.edit(text, reply_markup=InlineKeyboardMarkup(buttons))
             await callback.answer()
 
- advanced-filestore-bot-upgrade-16475289135707005334
         elif data == "set_delete_timer":
             await callback.message.edit(
                 "⏱ **Set Auto-Delete Timer**\n\nSend command: `/settimer SECONDS` (e.g., `/settimer 600` for 10 mins).",
@@ -1999,7 +1794,6 @@ def register_handlers(app: Client):
                 f"URL: `{bot_info.get('shortener_url', 'Not set')}`\n\n"
                 f"To change, use command:\n`/shortener`"
             )
- main
             await callback.message.edit(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
             await callback.answer()
 
@@ -2020,27 +1814,12 @@ def register_handlers(app: Client):
             msg = broadcast_data["message"]
             bot_ids = broadcast_data["bot_ids"]
             
- advanced-filestore-bot-upgrade-16475289135707005334
-            status_msg = await callback.message.edit("📢 **Broadcasting Started...**")
-            
-            success, failed = await broadcast_message(msg, bot_ids, status_msg)
-            
-            del TEMP_BROADCAST_DATA[user_id]
-            await status_msg.edit(
-                f"✅ **Broadcast Completed!**\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ Success: `{success}`\n"
-                f"❌ Failed: `{failed}`\n"
-                f"🤖 Bots: `{len(bot_ids)}`"
-            )
-
             status_msg = await callback.message.edit("📢 **Broadcasting in progress...**")
             
             success, failed = await broadcast_message(msg, bot_ids, status_msg=status_msg)
             
             del TEMP_BROADCAST_DATA[user_id]
             await status_msg.edit(f"✅ **Broadcast Completed!**\n\n📈 **Results:**\n ├ Success: `{success}`\n ├ Failed: `{failed}`\n └ Total Bots: `{len(bot_ids)}`")
- main
         
         elif data == "cancel_broadcast":
             if user_id in TEMP_BROADCAST_DATA:
