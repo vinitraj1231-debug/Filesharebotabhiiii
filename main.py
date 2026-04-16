@@ -25,14 +25,15 @@ from pyrogram.errors import FloodWait, UserNotParticipant, ChatAdminRequired
 from pyrogram.enums import ChatMemberStatus, ParseMode
 
 # ═══════════════════════════════════════════════════════════════
-# 🔧 CONFIGURATION (अपनी डिटेल्स यहाँ डालें)
+# 🔧 CONFIGURATION (अपनी डिटेल्स यहाँ डालें या Env Vars उपयोग करें)
 # ═══════════════════════════════════════════════════════════════
 
-API_ID = 23790796  # अपना API ID यहाँ डालें
-API_HASH = "626eb31c9057007df4c2851b3074f27f"  # अपना API HASH यहाँ डालें
-MAIN_BOT_TOKEN = "8607033631:AAEEHymSzeLeP8wpH1TR4vnZSyai3kI1DTE"  # अपना Main Bot Token यहाँ डालें
-MAIN_ADMIN = 8756786934  # अपनी Telegram User ID यहाँ डालें (e.g., 12345678)
-DB_CHANNEL = -1003982754680  # अपना Database Channel ID यहाँ डालें (Must be Admin)
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+MAIN_BOT_TOKEN = os.getenv("MAIN_BOT_TOKEN")
+MAIN_ADMIN = int(os.getenv("MAIN_ADMIN"))
+DB_CHANNEL = int(os.getenv("DB_CHANNEL"))
+PORT = os.getenv("PORT", "8080")
 
 FILE_CACHE_DURATION = 60 * 60  # 60 minutes cache
 
@@ -1937,6 +1938,18 @@ async def background_tasks():
         except Exception as e:
             logger.error(f"Background task error: {e}")
 
+async def handle(request):
+    return aiohttp.web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = aiohttp.web.Application()
+    app.add_routes([aiohttp.web.get('/', handle)])
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(PORT))
+    await site.start()
+    logger.info(f"🚀 Web server started on port {PORT}")
+
 async def main():
     print("╔═══════════════════════════════════════════════════════╗")
     print("║   🚀 ULTRA FILESTORE BOT - COMPLETE & FIXED         ║")
@@ -1985,6 +1998,9 @@ async def main():
     # Start background tasks
     asyncio.create_task(background_tasks())
     
+    # Start web server for Render
+    asyncio.create_task(start_web_server())
+
     # Keep running
     await idle()
     
