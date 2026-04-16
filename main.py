@@ -42,6 +42,21 @@ ADMINS_DB = f"{DB_FOLDER}/admins.json"
 FILE_CACHE_DB = f"{DB_FOLDER}/file_cache.json"
 CONFIG_DB = f"{DB_FOLDER}/config.json"
 
+GLOBAL_CONFIG_CACHE = {}
+
+def get_global_config():
+    global GLOBAL_CONFIG_CACHE
+    if not GLOBAL_CONFIG_CACHE:
+        GLOBAL_CONFIG_CACHE = load_db(CONFIG_DB)
+    return GLOBAL_CONFIG_CACHE
+
+def update_global_config(key, value):
+    global GLOBAL_CONFIG_CACHE
+    config = load_db(CONFIG_DB)
+    config[key] = value
+    save_db(CONFIG_DB, config)
+    GLOBAL_CONFIG_CACHE = config
+
 BOT_COMMANDS = [
     BotCommand("start", "🚀 Start the bot"),
     BotCommand("admin", "⚡ Admin Panel"),
@@ -111,16 +126,19 @@ async def backup_db_to_telegram():
     except Exception as e:
         logger.error(f"Backup failed: {e}")
 
-def add_user(user_id, bot_id, username=None, name=None):
+def add_user(user_id, bot_id, username=None, name=None, referred_by=None):
     users = load_db(USERS_DB)
     user_key = f"{bot_id}_{user_id}"
     if user_key not in users:
         users[user_key] = {
             "user_id": user_id, "bot_id": bot_id, "username": username, "name": name,
             "join_date": str(datetime.now()), "is_banned": False,
-            "files_uploaded": 0, "batches_created": 0, "bots_cloned": 0
+            "files_uploaded": 0, "batches_created": 0, "bots_cloned": 0,
+            "referred_by": referred_by, "referrals": 0, "is_premium": False
         }
         save_db(USERS_DB, users)
+        if referred_by:
+            update_user_stats(referred_by, bot_id, "referrals")
     return users[user_key]
 
 def get_user(user_id, bot_id):
@@ -170,8 +188,8 @@ def save_bot_info(token, bot_id, bot_username, owner_id, owner_name, parent_bot_
     bots[str(bot_id)] = {
         "token": token, "bot_id": bot_id, "bot_username": bot_username,
         "owner_id": owner_id, "owner_name": owner_name, "parent_bot_id": parent_bot_id,
-        "created_on": str(datetime.now()), "force_sub": None, "is_active": True,
-        "custom_welcome": None
+        "created_on": str(datetime.now()), "force_subs": [], "is_active": True,
+        "custom_welcome": None, "auto_delete_timer": 600
     }
     save_db(BOTS_DB, bots)
     if parent_bot_id:
@@ -204,13 +222,13 @@ def get_all_descendant_bots(parent_bot_id):
     recurse(parent_bot_id)
     return all_descendants
 
-def cascade_force_sub(parent_bot_id, channel_id):
+def cascade_force_subs(parent_bot_id, force_subs):
     descendants = get_all_descendant_bots(parent_bot_id)
     bots = load_db(BOTS_DB)
     count = 0
     for bot in descendants:
         if str(bot['bot_id']) in bots:
-            bots[str(bot['bot_id'])]['force_sub'] = channel_id
+            bots[str(bot['bot_id'])]['force_subs'] = force_subs
             count += 1
     save_db(BOTS_DB, bots)
     return count
@@ -298,47 +316,79 @@ async def start_bot(token, parent_bot_id=None):
 
 async def check_force_sub(client, user_id):
     bot_info = get_bot_info(client.me.id)
-    if not bot_info or not bot_info.get("force_sub"):
-        return True, None
+    if not bot_info or not bot_info.get("force_subs"):
+        return True, []
     
-    channel_id = bot_info["force_sub"]
-    try:
-        member = await client.get_chat_member(channel_id, user_id)
-        if member.status in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
-            return True, None
-    except UserNotParticipant:
-        pass
-    except Exception:
-        # If bot can't check (not admin), we assume True to avoid blocking
-        return True, None
+    must_join = []
+    for channel_id in bot_info["force_subs"]:
+        try:
+            member = await client.get_chat_member(channel_id, user_id)
+            if member.status not in [ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER]:
+                must_join.append(channel_id)
+        except UserNotParticipant:
+            must_join.append(channel_id)
+        except Exception:
+            # Skip if bot is not admin in that channel
+            continue
 
-    try:
-        chat = await client.get_chat(channel_id)
-        link = chat.invite_link
-        if not link:
-            link = f"https://t.me/{chat.username}" if chat.username else None
-        return False, link
-    except:
-        return True, None
+    if not must_join:
+        return True, []
 
-async def broadcast_message(message_text, bot_ids=None):
+    links = []
+    for c_id in must_join:
+        try:
+            chat = await client.get_chat(c_id)
+            link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
+            if link:
+                links.append({"title": chat.title, "link": link})
+        except:
+            continue
+
+    return (False, links) if links else (True, [])
+
+async def broadcast_message(original_msg, bot_ids=None, status_msg=None):
     if bot_ids is None:
         bot_ids = list(ACTIVE_CLIENTS.keys())
     
     success, failed = 0, 0
-    for bot_id in bot_ids:
+    total_bots = len(bot_ids)
+
+    for b_idx, bot_id in enumerate(bot_ids, 1):
         if bot_id not in ACTIVE_CLIENTS:
             continue
-        app = ACTIVE_CLIENTS[bot_id]["app"]
-        for user in get_all_users(bot_id):
+
+        client_data = ACTIVE_CLIENTS[bot_id]
+        app = client_data["app"]
+        users = get_all_users(bot_id)
+        total_users = len(users)
+
+        for u_idx, user in enumerate(users, 1):
             try:
-                await app.send_message(user['user_id'], message_text, parse_mode=ParseMode.MARKDOWN)
+                # Advanced Copy logic (handles all media types + buttons)
+                await original_msg.copy(user['user_id'])
                 success += 1
-                await asyncio.sleep(0.05)
             except FloodWait as e:
                 await asyncio.sleep(e.value)
+                await original_msg.copy(user['user_id'])
+                success += 1
             except:
                 failed += 1
+
+            # Real-time progress tracking
+            if status_msg and (success + failed) % 10 == 0:
+                try:
+                    progress = f"📢 **Broadcast Progress**\n\n" \
+                               f"🤖 Bot: {b_idx}/{total_bots} (@{client_data['username']})\n" \
+                               f"👥 Users: {u_idx}/{total_users}\n" \
+                               f"━━━━━━━━━━━━━━━━━━━━\n" \
+                               f"✅ Success: `{success}`\n" \
+                               f"❌ Failed: `{failed}`\n" \
+                               f"📊 Total: `{success + failed}`"
+                    await status_msg.edit(progress)
+                except:
+                    pass
+            await asyncio.sleep(0.05) # Flood prevention
+
     return success, failed
 
 # ═══════════════════════════════════════════════════════════════
@@ -357,8 +407,9 @@ def get_start_keyboard(bot_id, user_id):
     
     buttons.extend([
         [InlineKeyboardButton("📦 Batch", callback_data="start_batch"), InlineKeyboardButton("🤖 Clone", callback_data="clone_menu")],
-        [InlineKeyboardButton("📊 Dashboard", callback_data="user_dashboard"), InlineKeyboardButton("🎯 My Bots", callback_data="my_bots_menu")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="bot_settings"), InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")]
+        [InlineKeyboardButton("📊 Dashboard", callback_data="user_dashboard"), InlineKeyboardButton("🎁 Referral", callback_data="referral_menu")],
+        [InlineKeyboardButton("🎯 My Bots", callback_data="my_bots_menu"), InlineKeyboardButton("⚙️ Settings", callback_data="bot_settings")],
+        [InlineKeyboardButton("💎 Premium", callback_data="premium_menu"), InlineKeyboardButton("ℹ️ Help", callback_data="help_menu")]
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -390,23 +441,34 @@ def register_handlers(app: Client):
         bot_id = client.me.id
         
         # Check Maintenance
-        config = load_db(CONFIG_DB)
+        config = get_global_config()
         if config.get("maintenance") and user_id != MAIN_ADMIN:
             return await message.reply("🚧 **Bot is under maintenance!**\n\nPlease try again later.")
 
         if is_user_banned(user_id, bot_id):
             return await message.reply("🚫 You are banned!")
         
-        add_user(user_id, bot_id, message.from_user.username, message.from_user.first_name)
+        referred_by = None
+        if len(message.command) > 1 and message.command[1].startswith("ref_"):
+            try:
+                referred_by = int(message.command[1][4:])
+                if referred_by == user_id: referred_by = None
+            except:
+                pass
+
+        add_user(user_id, bot_id, message.from_user.username, message.from_user.first_name, referred_by)
         
-        is_subbed, channel_link = await check_force_sub(client, user_id)
-        if not is_subbed and channel_link:
+        is_subbed, sub_links = await check_force_sub(client, user_id)
+        if not is_subbed:
+            buttons = []
+            for item in sub_links:
+                buttons.append([InlineKeyboardButton(f"📢 Join {item['title']}", url=item['link'])])
+
+            buttons.append([InlineKeyboardButton("🔄 Try Again", url=f"https://t.me/{client.me.username}?start={message.command[1] if len(message.command)>1 else ''}")])
+
             return await message.reply(
-                "⚠️ **Join Required!**\n\nPlease join our channel first to use this bot!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 Join Channel", url=channel_link)],
-                    [InlineKeyboardButton("🔄 Try Again", url=f"https://t.me/{client.me.username}?start={message.command[1] if len(message.command)>1 else ''}")]
-                ])
+                "⚠️ **Membership Required!**\n\nYou must join the following channels to use this bot:",
+                reply_markup=InlineKeyboardMarkup(buttons)
             )
         
         # Handle deep links
@@ -420,7 +482,8 @@ def register_handlers(app: Client):
                 
                 if file_data:
                     # Auto-delete Timer logic (High Advance Feature)
-                    auto_delete_time = 600 # 10 minutes default
+                    bot_info = get_bot_info(bot_id)
+                    auto_delete_time = bot_info.get("auto_delete_timer", 600)
 
                     # 1. Try copying from DB Channel (Most Reliable)
                     try:
@@ -431,16 +494,20 @@ def register_handlers(app: Client):
                             caption=file_data.get('caption')
                         )
 
-                        # Auto-delete task
-                        async def delete_after(msg, delay):
-                            await asyncio.sleep(delay)
-                            try:
-                                await msg.delete()
-                            except:
-                                pass
+                        # Auto-delete task (Premium bypass)
+                        user_data = get_user(user_id, bot_id)
+                        if user_data and user_data.get("is_premium"):
+                            await message.reply("💎 **Premium User Detected!** Auto-delete disabled for you.")
+                        else:
+                            async def delete_after(msg, delay):
+                                await asyncio.sleep(delay)
+                                try:
+                                    await msg.delete()
+                                except:
+                                    pass
 
-                        asyncio.create_task(delete_after(sent_msg, auto_delete_time))
-                        await message.reply(f"⏳ This file will be deleted automatically in {auto_delete_time//60} minutes for security reasons.")
+                            asyncio.create_task(delete_after(sent_msg, auto_delete_time))
+                            await message.reply(f"⏳ This file will be deleted automatically in {auto_delete_time//60} minutes for security reasons.")
                         return
                     except Exception as e:
                         logger.error(f"Copy from DB Channel failed: {e}")
@@ -510,7 +577,7 @@ def register_handlers(app: Client):
         
         # Standard Welcome
         bot_info = get_bot_info(bot_id)
-        config = load_db(CONFIG_DB)
+        config = get_global_config()
         global_msg = config.get("global_msg", "")
         welcome = bot_info.get('custom_welcome') if bot_info else None
         
@@ -601,7 +668,7 @@ def register_handlers(app: Client):
         
         await message.reply(text)
 
-    @app.on_message(filters.command(["ban", "unban", "info"]) & filters.private)
+    @app.on_message(filters.command(["ban", "unban", "info", "setpremium"]) & filters.private)
     async def admin_utils_handler(client, message):
         user_id = message.from_user.id
         bot_id = client.me.id
@@ -628,6 +695,15 @@ def register_handlers(app: Client):
                     await message.reply(f"✅ User `{target}` has been unbanned.")
                 else:
                     await message.reply("❌ User not found.")
+            elif cmd == "setpremium":
+                users = load_db(USERS_DB)
+                user_key = f"{bot_id}_{target}"
+                if user_key in users:
+                    users[user_key]["is_premium"] = True
+                    save_db(USERS_DB, users)
+                    await message.reply(f"💎 User `{target}` is now a **Premium** user!")
+                else:
+                    await message.reply("❌ User not found.")
             elif cmd == "info":
                 user = get_user(target, bot_id)
                 if not user:
@@ -639,15 +715,37 @@ def register_handlers(app: Client):
                     f"🏷 Name: {user.get('name', 'Unknown')}\n"
                     f"🔗 Username: @{user.get('username', 'None')}\n"
                     f"📅 Joined: {user.get('join_date', 'N/A')}\n"
-                    f"🚫 Banned: {'Yes' if user.get('is_banned') else 'No'}\n\n"
+                    f"🚫 Banned: {'Yes' if user.get('is_banned') else 'No'}\n"
+                    f"💎 Premium: {'Yes' if user.get('is_premium') else 'No'}\n\n"
                     f"📊 **Stats:**\n"
                     f"📤 Uploaded: {user.get('files_uploaded', 0)}\n"
                     f"📦 Batches: {user.get('batches_created', 0)}\n"
-                    f"🤖 Clones: {user.get('bots_cloned', 0)}"
+                    f"🤖 Clones: {user.get('bots_cloned', 0)}\n"
+                    f"🎁 Referrals: {user.get('referrals', 0)}"
                 )
                 await message.reply(info)
         except ValueError:
             await message.reply("❌ Invalid User ID!")
+
+    @app.on_message(filters.command("settimer") & filters.private)
+    async def set_timer_handler(client, message):
+        user_id = message.from_user.id
+        bot_id = client.me.id
+        bot_info = get_bot_info(bot_id)
+
+        if not bot_info or (bot_info['owner_id'] != user_id and user_id != MAIN_ADMIN):
+            return await message.reply("❌ No permission!")
+
+        if len(message.command) < 2:
+            return await message.reply("Usage: `/settimer SECONDS`")
+
+        try:
+            seconds = int(message.command[1])
+            if seconds < 0: raise ValueError
+            update_bot_info(bot_id, 'auto_delete_timer', seconds)
+            await message.reply(f"✅ Auto-delete timer set to `{seconds}` seconds.")
+        except:
+            await message.reply("❌ Invalid seconds!")
 
     @app.on_message(filters.command("setmsg") & filters.private)
     async def set_msg_handler(client, message):
@@ -682,9 +780,7 @@ def register_handlers(app: Client):
             return await message.reply("Usage: `/setglobal YOUR_MESSAGE`")
 
         msg = message.text.split(None, 1)[1]
-        config = load_db(CONFIG_DB)
-        config["global_msg"] = msg
-        save_db(CONFIG_DB, config)
+        update_global_config("global_msg", msg)
         await message.reply("✅ Global message set successfully!")
 
     @app.on_message(filters.command("botinfo") & filters.private)
@@ -699,7 +795,7 @@ def register_handlers(app: Client):
                 f"🤖 @{client.me.username}\n"
                 f"👤 Owner: {bot_info['owner_name']}\n"
                 f"🌳 Cloned Bots: {children}\n"
-                f"📢 Force Sub: {'✅' if bot_info.get('force_sub') else '❌'}"
+                f"📢 Force Sub: {len(bot_info.get('force_subs', []))} Channels"
             )
 
     @app.on_message(filters.command("clone") & filters.private)
@@ -757,24 +853,54 @@ def register_handlers(app: Client):
         if not bot_info or (bot_info['owner_id'] != user_id and user_id != MAIN_ADMIN):
             return await message.reply("❌ Only owner can set force subscribe!")
         
+        force_subs = bot_info.get('force_subs', [])
+
         if len(message.command) < 2:
-            current = bot_info.get('force_sub')
-            return await message.reply(
-                f"⚙️ **Force Subscribe Settings**\n\n"
-                f"Current: {'✅ ' + str(current) if current else '❌ Not set'}\n\n"
-                f"**To Set:** `/setfs -100xxxxxxxx`\n"
-                f"**To Remove:** `/setfs off`\n\n"
-                f"⚠️ Note: Add me as Admin in that channel first!"
+            text = "⚙️ **Force Subscribe Settings (Up to 6)**\n\n"
+            if force_subs:
+                for i, c_id in enumerate(force_subs, 1):
+                    text += f"{i}. `{c_id}`\n"
+            else:
+                text += "❌ No channels set."
+
+            text += (
+                f"\n**Add:** `/setfs -100xxxxxxxx`\n"
+                f"**Remove:** `/setfs off -100xxxx`\n"
+                f"**Clear All:** `/setfs clear`\n\n"
+                f"⚠️ Note: Bot must be Admin in the channel!"
             )
+            return await message.reply(text)
         
-        if message.command[1].lower() == "off":
-            update_bot_info(bot_id, 'force_sub', None)
-            # Cascade removal
-            count = cascade_force_sub(bot_id, None) if bot_info['owner_id'] == user_id else 0
-            return await message.reply(f"✅ Force Sub removed! (Also removed from {count} child bots)")
+        cmd = message.command[1].lower()
         
+        if cmd == "clear":
+            update_bot_info(bot_id, 'force_subs', [])
+            cascade_force_subs(bot_id, [])
+            return await message.reply("✅ All Force Sub channels cleared!")
+
+        if cmd == "off":
+            if len(message.command) < 3:
+                return await message.reply("Usage: `/setfs off -100xxxxxx` to remove specific channel.")
+            try:
+                target_id = int(message.command[2])
+                if target_id in force_subs:
+                    force_subs.remove(target_id)
+                    update_bot_info(bot_id, 'force_subs', force_subs)
+                    cascade_force_subs(bot_id, force_subs)
+                    return await message.reply(f"✅ Removed `{target_id}` from Force Sub.")
+                else:
+                    return await message.reply("❌ Channel not found in list.")
+            except:
+                return await message.reply("❌ Invalid Channel ID.")
+
         try:
             channel_id = int(message.command[1])
+            if channel_id in force_subs:
+                return await message.reply("❌ Channel already added.")
+
+            if len(force_subs) >= 6:
+                return await message.reply("❌ Maximum 6 channels allowed!")
+
             # Check admin rights
             try:
                 chat_member = await client.get_chat_member(channel_id, client.me.id)
@@ -784,12 +910,13 @@ def register_handlers(app: Client):
                  return await message.reply("❌ Cannot access channel! Make sure I am Admin and ID is correct.")
 
             chat = await client.get_chat(channel_id)
-            update_bot_info(bot_id, 'force_sub', channel_id)
+            force_subs.append(channel_id)
+            update_bot_info(bot_id, 'force_subs', force_subs)
             
-            count = cascade_force_sub(bot_id, channel_id) if bot_info['owner_id'] == user_id else 0
-            await message.reply(f"✅ **Force Sub Set!**\n\n📢 {chat.title}\n🆔 `{channel_id}`\n\nApplied to {count} child bots automatically.")
+            count = cascade_force_subs(bot_id, force_subs) if bot_info['owner_id'] == user_id else 0
+            await message.reply(f"✅ **Channel Added!**\n\n📢 {chat.title}\n🆔 `{channel_id}`\n\nApplied to {count} child bots automatically.")
         except ValueError:
-            await message.reply("❌ Invalid Channel ID! Must be an integer (e.g., -100xxxx).")
+            await message.reply("❌ Invalid Channel ID!")
         except Exception as e:
             await message.reply(f"❌ Error: {e}")
 
@@ -940,22 +1067,54 @@ def register_handlers(app: Client):
         elif data == "bot_settings":
             bot_info = get_bot_info(bot_id)
             if bot_info:
-                fs = "✅" if bot_info.get('force_sub') else "❌"
+                fs_count = len(bot_info.get('force_subs', []))
                 msg = "✅" if bot_info.get('custom_welcome') else "❌"
                 await callback.message.edit(
-                    f"⚙️ **Settings**\n\n🤖 @{client.me.username}\n📢 Force Sub: {fs}\n💬 Welcome: {msg}",
+                    f"⚙️ **Settings**\n\n🤖 @{client.me.username}\n📢 Force Sub: {fs_count} Channels\n💬 Welcome: {msg}",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]])
                 )
             await callback.answer()
         
         elif data == "help_menu":
             await callback.message.edit(
-                "ℹ️ **Help**\n\n"
-                "**📁 Files:** Send file → Get link\n"
-                "**📦 Batch:** Click Batch → Send files → /done\n"
-                "**🤖 Clone:** @BotFather → /newbot → /clone TOKEN",
+                "ℹ️ **Advanced Help Guide**\n\n"
+                "• **Files:** Send any file to get a secure link.\n"
+                "• **Batch:** Use `/batch`, send multiple files, then `/done`.\n"
+                "• **Clone:** Use `/clone` with your Bot Token.\n"
+                "• **Referral:** Invite friends to earn rewards.\n"
+                "• **Timer:** Files are deleted automatically after a set time.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]])
             )
+            await callback.answer()
+
+        elif data == "referral_menu":
+            user_data = get_user(user_id, bot_id)
+            ref_link = f"https://t.me/{client.me.username}?start=ref_{user_id}"
+            text = (
+                f"🎁 **Referral Program**\n\n"
+                f"Invite your friends and earn premium benefits!\n\n"
+                f"👥 Your Referrals: `{user_data.get('referrals', 0)}`\n"
+                f"🔗 Your Link:\n`{ref_link}`"
+            )
+            await callback.message.edit(text, reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Share Link", url=f"https://t.me/share/url?url={ref_link}")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
+            ]))
+            await callback.answer()
+
+        elif data == "premium_menu":
+            user_data = get_user(user_id, bot_id)
+            status = "💎 Premium" if user_data.get("is_premium") else "🆓 Free"
+            text = (
+                f"💎 **Premium Subscription**\n\n"
+                f"Status: **{status}**\n\n"
+                f"**Benefits:**\n"
+                f"• No auto-delete on your files\n"
+                f"• Higher file size limits\n"
+                f"• Priority support\n\n"
+                f"Contact @{ACTIVE_CLIENTS[MAIN_ADMIN]['username'] if MAIN_ADMIN in ACTIVE_CLIENTS else 'Admin'} to upgrade!"
+            )
+            await callback.message.edit(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]]))
             await callback.answer()
         
         elif data == "admin_panel":
@@ -1097,10 +1256,9 @@ def register_handlers(app: Client):
             if user_id != MAIN_ADMIN:
                 await callback.answer("❌ Access denied!", show_alert=True)
                 return
-            config = load_db(CONFIG_DB)
+            config = get_global_config()
             curr = config.get("maintenance", False)
-            config["maintenance"] = not curr
-            save_db(CONFIG_DB, config)
+            update_global_config("maintenance", not curr)
             await callback.answer(f"Maintenance: {'ON' if not curr else 'OFF'}", show_alert=True)
             await callback.message.edit("👑 **Supreme Panel**", reply_markup=get_supreme_panel_keyboard())
 
@@ -1111,24 +1269,32 @@ def register_handlers(app: Client):
                 f"⚙️ **Bot Settings**\n\n"
                 f"🤖 Bot: @{bot_info['bot_username']}\n"
                 f"👋 Custom Welcome: {'Enabled' if bot_info.get('custom_welcome') else 'Disabled'}\n"
-                f"⏱ Auto Delete: 10 Mins (Fixed)"
+                f"⏱ Auto Delete: {bot_info.get('auto_delete_timer', 600)//60} Mins"
             )
             buttons = [
                 [InlineKeyboardButton("💬 Set Welcome", callback_data="set_welcome_msg")],
+                [InlineKeyboardButton("⏱ Set Timer", callback_data="set_delete_timer")],
                 [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
             ]
             await callback.message.edit(text, reply_markup=InlineKeyboardMarkup(buttons))
             await callback.answer()
 
+        elif data == "set_delete_timer":
+            await callback.message.edit(
+                "⏱ **Set Auto-Delete Timer**\n\nSend command: `/settimer SECONDS` (e.g., `/settimer 600` for 10 mins).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="bot_settings_admin")]])
+            )
+            await callback.answer()
+
         elif data == "forcesub_admin":
             bot_info = get_bot_info(bot_id)
             if not bot_info: return
-            curr_fs = bot_info.get('force_sub', 'Not Set')
-            text = (
-                f"🔒 **Force Subscribe Settings**\n\n"
-                f"Current Channel: `{curr_fs}`\n\n"
-                f"To change, use command:\n`/setfs CHANNEL_ID` or `/setfs off`"
-            )
+            curr_fs = bot_info.get('force_subs', [])
+            text = f"🔒 **Force Subscribe Settings**\n\nChannels: {len(curr_fs)}/6\n\n"
+            for i, cid in enumerate(curr_fs, 1):
+                text += f"{i}. `{cid}`\n"
+
+            text += "\nTo manage, use command:\n`/setfs`"
             await callback.message.edit(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
             await callback.answer()
 
@@ -1149,20 +1315,18 @@ def register_handlers(app: Client):
             msg = broadcast_data["message"]
             bot_ids = broadcast_data["bot_ids"]
             
-            status_msg = await callback.message.edit("📢 Broadcasting started...")
-            msg_text = msg.text or msg.caption or "Message"
+            status_msg = await callback.message.edit("📢 **Broadcasting Started...**")
             
-            # Use copy_message if possible for media, else just text
-            if msg.media:
-                # Basic implementation for text broadcast, expanding for media requires iterating copy_message
-                # For safety/speed in this script, we'll stick to text loop if message has text
-                # Ideally one would loop copy_message
-                pass
-            
-            success, failed = await broadcast_message(msg_text, bot_ids)
+            success, failed = await broadcast_message(msg, bot_ids, status_msg)
             
             del TEMP_BROADCAST_DATA[user_id]
-            await status_msg.edit(f"✅ **Broadcast Done!**\n\nSent: {success}\nFailed: {failed}\nBots involved: {len(bot_ids)}")
+            await status_msg.edit(
+                f"✅ **Broadcast Completed!**\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ Success: `{success}`\n"
+                f"❌ Failed: `{failed}`\n"
+                f"🤖 Bots: `{len(bot_ids)}`"
+            )
         
         elif data == "cancel_broadcast":
             if user_id in TEMP_BROADCAST_DATA:
@@ -1271,6 +1435,10 @@ async def main():
     print("║   🚀 ULTRA FILESTORE BOT - COMPLETE & FIXED         ║")
     print("╚═══════════════════════════════════════════════════════╝")
     
+    if DB_CHANNEL == -1000000000000:
+        logger.error("❌ DB_CHANNEL not configured! Please set it in main.py")
+        return
+
     # 1. Start Main Bot
     logger.info("🔥 Starting Main Bot...")
     main_app = await start_bot(MAIN_BOT_TOKEN)
